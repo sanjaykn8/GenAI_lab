@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 LATENT_DIM = 256
 IMG_SIZE = 32
 BATCH_SIZE = 64
-EPOCHS = 10
+EPOCHS = 20
 LR = 2e-4
 D_REG = 16
 GAMMA = 10.0
@@ -48,6 +48,8 @@ class MappingNetwork(tf.keras.Model):
 class ModulatedConv2d(tf.keras.layers.Layer):
     def __init__(self, in_ch, out_ch, kernel_size=3, demodulate=True, upsample=False):
         super().__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
         self.k = kernel_size
         self.demodulate = demodulate
         self.upsample = upsample
@@ -61,17 +63,30 @@ class ModulatedConv2d(tf.keras.layers.Layer):
             h, wd = tf.shape(x)[1], tf.shape(x)[2]
             x = tf.image.resize(x, (h * 2, wd * 2), method="nearest")
 
+        batch_size = tf.shape(x)[0]
+        h, wd = tf.shape(x)[1], tf.shape(x)[2]
+
         s = self.style_proj(w)
-        w_hat = self.kernel[None, ...] * s[:, None, None, :, None]
+        w_hat = self.kernel[None, ...] * s[:, None, None, :, None]  # (B, k, k, in, out)
         if self.demodulate:
             demod = tf.math.rsqrt(tf.reduce_sum(tf.square(w_hat), axis=[1, 2, 3], keepdims=True) + EPS)
             w_hat = w_hat * demod
 
-        def conv_one(inputs):
-            xi, ki = inputs
-            return tf.nn.conv2d(xi[None, ...], ki, strides=1, padding="SAME")[0]
+        # Vectorized per-sample conv via a single grouped convolution instead of a
+        # Python-level tf.map_fn loop over the batch: fold the batch dim into the
+        # channel dim on both the input and the kernel, then run ONE conv2d call
+        # with groups == batch_size. Same math as looping per-sample, but runs as
+        # one fused op instead of `batch_size` separate eager/graph conv calls.
+        x_grouped = tf.transpose(x, [1, 2, 0, 3])                       # (H, W, B, Cin)
+        x_grouped = tf.reshape(x_grouped, [1, h, wd, batch_size * self.in_ch])
 
-        return tf.map_fn(conv_one, (x, w_hat), fn_output_signature=tf.float32)
+        w_grouped = tf.transpose(w_hat, [1, 2, 3, 0, 4])                # (k, k, Cin, B, Cout)
+        w_grouped = tf.reshape(w_grouped, [self.k, self.k, self.in_ch, batch_size * self.out_ch])
+
+        out = tf.nn.conv2d(x_grouped, w_grouped, strides=1, padding="SAME")
+        out = tf.reshape(out, [h, wd, batch_size, self.out_ch])
+        out = tf.transpose(out, [2, 0, 1, 3])                           # (B, H, W, Cout)
+        return out
 
 
 class NoiseInjection(tf.keras.layers.Layer):
@@ -160,9 +175,42 @@ def g_loss_fn(fake_logits):
     return tf.reduce_mean(tf.nn.softplus(-fake_logits))
 
 
+def make_train_step(generator, discriminator, g_opt, d_opt):
+    # @tf.function traces this once into a graph instead of re-running the Python
+    # loop body (and re-tracing every layer call) on every single batch. This is
+    # the single biggest speed lever here, on top of the vectorized conv above.
+    @tf.function
+    def train_step(real_images, step):
+        batch_size = tf.shape(real_images)[0]
+        z = tf.random.normal((batch_size, LATENT_DIM))
+
+        with tf.GradientTape() as d_tape:
+            fake_images = generator(z)
+            real_logits = discriminator(real_images)
+            fake_logits = discriminator(fake_images)
+            d_loss = d_loss_fn(real_logits, fake_logits)
+            if tf.equal(step % D_REG, 0):
+                d_loss = d_loss + (GAMMA / 2) * r1_penalty(discriminator, real_images)
+        d_grads = d_tape.gradient(d_loss, discriminator.trainable_variables)
+        d_opt.apply_gradients(zip(d_grads, discriminator.trainable_variables))
+
+        z = tf.random.normal((batch_size, LATENT_DIM))
+        with tf.GradientTape() as g_tape:
+            fake_images = generator(z)
+            fake_logits = discriminator(fake_images)
+            g_loss = g_loss_fn(fake_logits)
+        g_grads = g_tape.gradient(g_loss, generator.trainable_variables)
+        g_opt.apply_gradients(zip(g_grads, generator.trainable_variables))
+
+        return g_loss, d_loss
+
+    return train_step
+
+
 def train(generator, discriminator, dataset, epochs=EPOCHS, lr=LR):
     g_opt = tf.keras.optimizers.Adam(lr, beta_1=0.0, beta_2=0.99)
     d_opt = tf.keras.optimizers.Adam(lr, beta_1=0.0, beta_2=0.99)
+    train_step = make_train_step(generator, discriminator, g_opt, d_opt)
 
     z_ref = tf.random.normal((16, LATENT_DIM), seed=42)
     g_losses, d_losses = [], []
@@ -171,30 +219,13 @@ def train(generator, discriminator, dataset, epochs=EPOCHS, lr=LR):
 
     for epoch in range(1, epochs + 1):
         e_g, e_d = [], []
-        for real_images in dataset:
+        for batch_idx, real_images in enumerate(dataset):
             step += 1
-            batch_size = tf.shape(real_images)[0]
-            z = tf.random.normal((batch_size, LATENT_DIM))
-
-            with tf.GradientTape() as d_tape:
-                fake_images = generator(z)
-                real_logits = discriminator(real_images)
-                fake_logits = discriminator(fake_images)
-                d_loss = d_loss_fn(real_logits, fake_logits)
-                if step % D_REG == 0:
-                    d_loss = d_loss + (GAMMA / 2) * r1_penalty(discriminator, real_images)
-            d_grads = d_tape.gradient(d_loss, discriminator.trainable_variables)
-            d_opt.apply_gradients(zip(d_grads, discriminator.trainable_variables))
-
-            z = tf.random.normal((batch_size, LATENT_DIM))
-            with tf.GradientTape() as g_tape:
-                fake_images = generator(z)
-                fake_logits = discriminator(fake_images)
-                g_loss = g_loss_fn(fake_logits)
-            g_grads = g_tape.gradient(g_loss, generator.trainable_variables)
-            g_opt.apply_gradients(zip(g_grads, generator.trainable_variables))
-
+            g_loss, d_loss = train_step(real_images, tf.constant(step, dtype=tf.int64))
             e_g.append(float(g_loss)); e_d.append(float(d_loss))
+
+            if batch_idx % 50 == 0:
+                print(f"  epoch {epoch} step {batch_idx}  G={float(g_loss):.4f}  D={float(d_loss):.4f}")
 
         g_losses.append(np.mean(e_g)); d_losses.append(np.mean(e_d))
         print(f"Epoch {epoch}/{epochs}  G_loss={g_losses[-1]:.4f}  D_loss={d_losses[-1]:.4f}")
@@ -240,3 +271,6 @@ if __name__ == "__main__":
 
     g_losses, d_losses = train(generator, discriminator, dataset, epochs=EPOCHS)
     plot_losses(g_losses, d_losses)
+
+    generator.save_weights(os.path.join(OUT_DIR, "generator.weights.h5"))
+    discriminator.save_weights(os.path.join(OUT_DIR, "discriminator.weights.h5"))
